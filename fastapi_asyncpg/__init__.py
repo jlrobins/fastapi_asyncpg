@@ -1,14 +1,12 @@
 from __future__ import annotations
-
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 import asyncpg
 import typing
 
-
 async def noop(db: asyncpg.Connection):
     return
-
 
 class configure_asyncpg:
     def __init__(
@@ -38,27 +36,36 @@ class configure_asyncpg:
         self.init_db = init_db
         self.con_opts = options
         self._pool = pool
-        self.app.router.add_event_handler("startup", self.on_connect)
-        self.app.router.add_event_handler("shutdown", self.on_disconnect)
+
+    @asynccontextmanager
+    async def lifespan(self):
+        """This is a context manager that should be used on the app creation
+        to manage the connection pool, it will call on_connect and on_disconnect
+        on the app events
+        """
+        await self.on_connect()
+        yield
+        await self.on_disconnect()
 
     async def on_connect(self):
         """handler called during initialitzation of asgi app, that connects to
         the db"""
         # if the pool is comming from outside (tests), don't connect it
         if self._pool:
-            self.app.state.pool = self._pool
+            self._get_pool_manager_from_app().put(self.dsn, self._pool)
             return
         pool = await asyncpg.create_pool(dsn=self.dsn, **self.con_opts)
         async with pool.acquire() as db:
             await self.init_db(db)
-        self.app.state.pool = pool
+
+        self._get_pool_manager_from_app().put(self.dsn, pool)
 
     async def on_disconnect(self):
         # if the pool is comming from outside, don't desconnect it
         # someone else will do (usualy a pytest fixture)
         if self._pool:
             return
-        await self.app.state.pool.close()
+        await self.pool.close()
 
     def on_init(self, func):
         self.init_db = func
@@ -66,7 +73,10 @@ class configure_asyncpg:
 
     @property
     def pool(self):
-        return self.app.state.pool
+        """Fetch the connection pool associated with our DSN from the
+        pool manager stashed within app.state.
+        """
+        return self._get_pool_manager_from_app().get(self.dsn)
 
     async def connection(self):
         """
@@ -81,7 +91,7 @@ class configure_asyncpg:
         async with self.pool.acquire() as db:
             yield db
 
-    async def transaction(self):
+    async def transaction(self) -> typing.AsyncGenerator[asyncpg.Connection, None]:
         """
         A ready to use transaction Dependecy just usable on a path function
         Example:
@@ -103,7 +113,33 @@ class configure_asyncpg:
             else:
                 await txn.commit()
 
+    def _get_pool_manager_from_app(self):
+        """Find or create singleton AppPoolManager instance within self.app.state"""
+        if not hasattr(self.app.state, "fastapi_asyncpg_pool_manager"):
+            self.app.state.fastapi_asyncpg_pool_manager = AppPoolManager()
+
+        return self.app.state.fastapi_asyncpg_pool_manager
+
     atomic = transaction
+
+
+class AppPoolManager:
+    """Object placed into fastapi app.state to manage one or more
+    asyncpg.pool.Pool instances within the fastapi app.
+
+    If the app uses more than one asyncpg database, then there
+    will be more than one pool. We separate them by the
+    connection DSN.
+    """
+
+    def __init__(self):
+        self._pool_by_dsn = {}
+
+    def get(self, dsn):
+        return self._pool_by_dsn[dsn]
+
+    def put(self, dsn, pool):
+        self._pool_by_dsn[dsn] = pool
 
 
 class SingleConnectionTestingPool:
