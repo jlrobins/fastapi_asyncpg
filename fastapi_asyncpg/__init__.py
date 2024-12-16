@@ -8,7 +8,7 @@ import typing
 async def noop(db: asyncpg.Connection):
     return
 
-class configure_asyncpg:
+class FastAPIAsyncPG:
     def __init__(
         self,
         app: FastAPI,
@@ -36,6 +36,9 @@ class configure_asyncpg:
         self.init_db = init_db
         self.con_opts = options
         self._pool = pool
+
+    def set_app(self, app: FastAPI):
+        self.app = app
 
     @asynccontextmanager
     async def lifespan(self):
@@ -122,6 +125,7 @@ class configure_asyncpg:
 
     atomic = transaction
 
+configure_asyncpg = FastAPIAsyncPG
 
 class AppPoolManager:
     """Object placed into fastapi app.state to manage one or more
